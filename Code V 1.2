@@ -1,0 +1,184 @@
+# System32 Guardian — Portable Pack (CMD Launchers)
+
+Drop these **.cmd** files in the same folder as `Guardian.ps1` (e.g., `C:\S32Guardian`). They always launch PowerShell with `-ExecutionPolicy Bypass` so policy won’t block you.
+
+> **Tip:** Right‑click → **Run as administrator** for anything that installs or changes system state (Init / InstallTask).
+
+---
+
+## 1) `Guardian-Init.cmd`
+
+```bat
+@echo off
+setlocal
+set DIR=%~dp0
+set PS1=%DIR%Guardian.ps1
+if not exist "%PS1%" (
+  echo [!] Guardian.ps1 not found in %DIR%
+  exit /b 1
+)
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Init
+```
+
+## 2) `Guardian-InstallTask.cmd`
+
+```bat
+@echo off
+setlocal
+set DIR=%~dp0
+set PS1=%DIR%Guardian.ps1
+if not exist "%PS1%" (
+  echo [!] Guardian.ps1 not found in %DIR%
+  exit /b 1
+)
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -InstallTask
+```
+
+## 3) `Guardian-Tray.cmd`
+
+```bat
+@echo off
+setlocal
+set DIR=%~dp0
+set PS1=%DIR%Guardian.ps1
+if not exist "%PS1%" (
+  echo [!] Guardian.ps1 not found in %DIR%
+  exit /b 1
+)
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Tray
+```
+
+## 4) `Guardian-Watch.cmd`
+
+```bat
+@echo off
+setlocal
+set DIR=%~dp0
+set PS1=%DIR%Guardian.ps1
+if not exist "%PS1%" (
+  echo [!] Guardian.ps1 not found in %DIR%
+  exit /b 1
+)
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Watch
+```
+
+## 5) `Guardian-Dashboard.cmd`
+
+```bat
+@echo off
+setlocal
+set DIR=%~dp0
+set PS1=%DIR%Guardian.ps1
+if not exist "%PS1%" (
+  echo [!] Guardian.ps1 not found in %DIR%
+  exit /b 1
+)
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Dashboard -DashboardPort 8787
+```
+
+## 6) `Guardian-Report.cmd`
+
+```bat
+@echo off
+setlocal
+set DIR=%~dp0
+set PS1=%DIR%Guardian.ps1
+if not exist "%PS1%" (
+  echo [!] Guardian.ps1 not found in %DIR%
+  exit /b 1
+)
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Report
+```
+
+## 7) `Guardian-Status.cmd`
+
+```bat
+@echo off
+setlocal
+set DIR=%~dp0
+set PS1=%DIR%Guardian.ps1
+if not exist "%PS1%" (
+  echo [!] Guardian.ps1 not found in %DIR%
+  exit /b 1
+)
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Status | more
+```
+
+## 8) `Guardian-UninstallTask.cmd`
+
+```bat
+@echo off
+setlocal
+set DIR=%~dp0
+set PS1=%DIR%Guardian.ps1
+if not exist "%PS1%" (
+  echo [!] Guardian.ps1 not found in %DIR%
+  exit /b 1
+)
+PowerShell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -UninstallTask
+```
+
+---
+
+## Optional: unblock the script if it was downloaded
+
+Create `Guardian-Unblock.cmd`:
+
+```bat
+@echo off
+PowerShell -NoProfile -ExecutionPolicy Bypass -Command Unblock-File -Path "C:\S32Guardian\Guardian.ps1"
+```
+
+## Optional: quick verify the file exists
+
+Create `Guardian-Check.cmd`:
+
+```bat
+@echo off
+if exist "C:\S32Guardian\Guardian.ps1" (
+  echo Found: C:\S32Guardian\Guardian.ps1
+) else (
+  echo Missing: C:\S32Guardian\Guardian.ps1
+)
+```
+
+---
+
+### Usage
+
+1. Put `Guardian.ps1` and any of these `.cmd` files in **the same folder**.
+2. Double‑click the `.cmd` you want (or run from an elevated console):
+
+   * `Guardian-Init.cmd` → build baseline
+   * `Guardian-InstallTask.cmd` → install hardened SYSTEM task
+   * `Guardian-Tray.cmd` → tray with balloons + quick controls
+   * `Guardian-Watch.cmd` → console watcher
+   * `Guardian-Dashboard.cmd` → open live web UI
+   * `Guardian-Report.cmd` → write a static HTML report
+   * `Guardian-Status.cmd` → print status
+   * `Guardian-UninstallTask.cmd` → remove the task
+
+> If a **Group Policy** still blocks script execution for *all* modes, these launchers will still work in most environments because they invoke PowerShell with `-ExecutionPolicy Bypass` for a **new process** and do not change system policy. If your org enforces policy via GPO *and* blocks Bypass, use **code-signing** or a **service/EXE** packaging route (I can provide both).
+
+
+
+
+
+
+Repacked! I dropped a **Portable Pack (CMD Launchers)** into canvas. These `.cmd` files run Guardian with `-ExecutionPolicy Bypass` so policy won’t block you anymore.
+
+### What to do
+
+1. Put `Guardian.ps1` and the `.cmd` files in the **same folder** (e.g., `C:\S32Guardian`).
+2. Double-click:
+
+* `Guardian-Init.cmd` → build baseline
+* `Guardian-InstallTask.cmd` → install hardened SYSTEM task
+* `Guardian-Tray.cmd` → tray app w/ balloons
+* `Guardian-Watch.cmd` → console watcher
+* `Guardian-Dashboard.cmd` → live web UI
+* `Guardian-Report.cmd` → static report
+* `Guardian-Status.cmd` → quick status
+* `Guardian-UninstallTask.cmd` → remove task
+
+If your org GPO still blocks Bypass entirely, I can package this as a **signed script** or a **Windows service/EXE** next.
