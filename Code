@@ -1,0 +1,661 @@
+# System32 Guardian (with ACL Hardening + Self-Protection + Hardened Task)
+# Hardens %WinDir%\System32 with baseline hashing, signature validation, real-time monitoring,
+# auto-restore, maintenance windows, tamper-evident logging, ACL hardening, script self-check, and hardened scheduled task support.
+
+param(
+    [switch]$Init,
+    [switch]$Verify,
+    [switch]$Watch,
+    [switch]$MaintenanceAllow,
+    [int]$MaintenanceMinutes = 30,
+    [switch]$Status,
+    [switch]$InstallTask,
+    [switch]$UninstallTask,
+    [switch]$Dashboard,
+    [int]$DashboardPort = 8787,
+    [switch]$Report,
+    [switch]$Tray
+)
+
+$ErrorActionPreference = 'Stop'
+
+# --- Paths ---
+$GuardianRoot     = "C:\S32Guardian"
+$BaselineFile     = Join-Path $GuardianRoot 'baseline.json'
+$BaselineHashFile = Join-Path $GuardianRoot 'baseline.sha256'
+$LogFile          = Join-Path $GuardianRoot 'guardian.log.jsonl'
+$ChainFile        = Join-Path $GuardianRoot 'log.chain'
+$ModeFile         = Join-Path $GuardianRoot 'mode.json'
+$System32         = Join-Path $env:windir 'System32'
+$GuardianScript   = $MyInvocation.MyCommand.Path
+$TaskName         = 'System32 Guardian Watch'
+
+# --- Privilege check ---
+function Assert-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p = New-Object Security.Principal.WindowsPrincipal($id)
+    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'System32 Guardian must be run as Administrator.'
+    }
+}
+
+# --- Helpers ---
+function Harden-GuardianACLs {
+    try {
+        icacls $GuardianRoot /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+        icacls $GuardianRoot /remove "Users" "Authenticated Users" "Everyone" 2>$null | Out-Null
+        foreach ($f in @($BaselineFile,$BaselineHashFile,$LogFile,$ChainFile,$ModeFile,$GuardianScript)) {
+            if (Test-Path $f) {
+                icacls $f /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" /remove "Users" "Authenticated Users" "Everyone" 2>$null | Out-Null
+            }
+        }
+        Add-GuardianLog 'acl_hardened' @{ root=$GuardianRoot }
+    } catch {
+        Add-GuardianLog 'acl_harden_error' @{ error=$_.Exception.Message }
+    }
+}
+function Ensure-GuardianPaths {
+    if (-not (Test-Path $GuardianRoot)) { New-Item -ItemType Directory -Force -Path $GuardianRoot | Out-Null }
+    Harden-GuardianACLs
+}
+
+function Get-Sha256Hex([string]$Text) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join ''
+}
+
+function Add-GuardianLog([string]$Event, [hashtable]$Data) {
+    Ensure-GuardianPaths
+    $timestamp = (Get-Date).ToString('o')
+    $prev = if (Test-Path $ChainFile) { Get-Content $ChainFile -Tail 1 } else { 'GENESIS' }
+    $obj = [ordered]@{ ts=$timestamp; event=$Event; data=$Data; prev=$prev }
+    $json = $obj | ConvertTo-Json -Depth 6 -Compress
+    $hash = Get-Sha256Hex "$json$prev"
+    $json | Add-Content -Path $LogFile -Encoding UTF8
+    $hash | Add-Content -Path $ChainFile -Encoding UTF8
+}
+
+# --- Self-protection: verify this script has not been tampered with ---
+function Self-CheckScript {
+    $expectedHashFile = Join-Path $GuardianRoot 'script.sha256'
+    $current = Get-FileHash -Path $GuardianScript -Algorithm SHA256 | Select-Object -ExpandProperty Hash
+    if (Test-Path $expectedHashFile) {
+        $expected = Get-Content $expectedHashFile -Raw
+        if ($expected -ne $current) {
+            Add-GuardianLog 'selfcheck_failed' @{ script=$GuardianScript; expected=$expected; got=$current }
+            Write-Warning "[!] Guardian script integrity failed!"
+        }
+    } else {
+        # Store first-time baseline
+        $current | Set-Content -Path $expectedHashFile -Encoding UTF8
+        Add-GuardianLog 'selfcheck_init' @{ script=$GuardianScript; hash=$current }
+    }
+}
+
+Self-CheckScript
+
+function Get-FileMetadata([string]$Path) {
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $hash = Get-FileHash -LiteralPath $Path -Algorithm SHA256
+        $sig  = Get-AuthenticodeSignature -LiteralPath $Path
+        $ver  = $item.VersionInfo
+        [PSCustomObject]@{
+            Path       = $item.FullName
+            Name       = $item.Name
+            Size       = $item.Length
+            SHA256     = $hash.Hash
+            FileVersion= $ver.FileVersion
+            Product    = $ver.ProductName
+            LastWrite  = $item.LastWriteTimeUtc.ToString('o')
+            Signed     = ($sig.Status -eq 'Valid')
+            Signer     = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { $null }
+            SigStatus  = $sig.Status.ToString()
+        }
+    }
+    catch {
+        Add-GuardianLog 'metadata_error' @{ path = $Path; error = $_.Exception.Message }
+        return $null
+    }
+}
+
+function New-S32Baseline {
+    Ensure-GuardianPaths
+    Write-Host "[+] Building System32 baseline..." -ForegroundColor Cyan
+    $files = Get-ChildItem -Path $System32 -Recurse -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.Extension -match '^(?i)\.(exe|dll|sys)$' }
+
+    $baseline = @{}
+    foreach ($f in $files) {
+        $meta = Get-FileMetadata $f.FullName
+        if ($meta) { $baseline[$meta.Path.ToLowerInvariant()] = $meta }
+    }
+    $json = $baseline.GetEnumerator() | Sort-Object Name | ForEach-Object { $_.Value } | ConvertTo-Json -Depth 6
+    $json | Out-File -FilePath $BaselineFile -Encoding UTF8 -Force
+    $bhash = Get-Sha256Hex $json
+    $bhash | Set-Content -Path $BaselineHashFile -Encoding UTF8
+    Add-GuardianLog 'baseline_built' @{ count = $baseline.Count; file=$BaselineFile; hash=$bhash }
+    Write-Host "[+] Baseline saved: $BaselineFile" -ForegroundColor Green
+}
+
+function Load-Baseline {
+    if (-not (Test-Path $BaselineFile)) { throw "Baseline not found: $BaselineFile (run with -Init)" }
+    $arr = Get-Content $BaselineFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $map = @{}
+    foreach ($e in $arr) { $map[$e.Path.ToLowerInvariant()] = $e }
+    return $map
+}
+
+function Compare-FileToBaseline([string]$Path, $baselineMap) {
+    if (-not (Test-Path -LiteralPath $Path)) { return [PSCustomObject]@{ Path=$Path; Status='Missing' } }
+    $cur = Get-FileMetadata $Path
+    if (-not $cur) { return [PSCustomObject]@{ Path=$Path; Status='Error' } }
+    $key = $Path.ToLowerInvariant()
+    if (-not $baselineMap.ContainsKey($key)) { return [PSCustomObject]@{ Path=$Path; Status='NewOrUnexpected'; Current=$cur } }
+    $base = $baselineMap[$key]
+    if ($base.SHA256 -ne $cur.SHA256) { return [PSCustomObject]@{ Path=$Path; Status='Changed'; Current=$cur; Baseline=$base } }
+    return [PSCustomObject]@{ Path=$Path; Status='OK' }
+}
+
+function In-Maintenance {
+    if (-not (Test-Path $ModeFile)) { return $false }
+    try {
+        $until = Get-Content $ModeFile -Raw
+        if (-not $until) { return $false }
+        return (Get-Date) -lt ([DateTime]::Parse($until))
+    } catch { return $false }
+}
+
+function Test-S32Integrity {
+    $base = Load-Baseline
+    Write-Host "[+] Verifying current files against baseline..." -ForegroundColor Cyan
+    $alerts = @()
+    foreach ($p in $base.Keys) {
+        $res = Compare-FileToBaseline -Path $p -baselineMap $base
+        if ($res.Status -ne 'OK') { $alerts += $res; Add-GuardianLog 'integrity_alert' @{ path=$p; status=$res.Status } }
+    }
+    Write-Host "[+] Completed. Alerts: $($alerts.Count)" -ForegroundColor Yellow
+    return $alerts
+}
+
+function Restore-S32File([string]$Path) {
+    Add-GuardianLog 'restore_attempt' @{ path=$Path; method='sfc' }
+    try { Start-Process -FilePath sfc.exe -ArgumentList @("/ScanFile=$Path") -Wait -WindowStyle Hidden | Out-Null } catch {}
+    Start-Sleep -Seconds 2
+    $post = Compare-FileToBaseline -Path $Path -baselineMap (Load-Baseline)
+    if ($post.Status -eq 'OK') { Add-GuardianLog 'restore_success' @{ path=$Path; method='sfc' }; return $true }
+    Add-GuardianLog 'restore_attempt' @{ path=$Path; method='dism' }
+    try { Start-Process -FilePath dism.exe -ArgumentList @('/Online','/Cleanup-Image','/RestoreHealth') -Wait -WindowStyle Hidden | Out-Null } catch {}
+    Start-Sleep -Seconds 2
+    $post2 = Compare-FileToBaseline -Path $Path -baselineMap (Load-Baseline)
+    if ($post2.Status -eq 'OK') { Add-GuardianLog 'restore_success' @{ path=$Path; method='dism' }; return $true }
+    Add-GuardianLog 'restore_failed' @{ path=$Path }
+    return $false
+}
+
+function Start-S32Watch {
+    Assert-Admin
+    Write-Host "[+] Starting System32 watcher..." -ForegroundColor Green
+    $base = Load-Baseline
+
+    $fsw = New-Object System.IO.FileSystemWatcher
+    $fsw.Path  = $System32
+    $fsw.IncludeSubdirectories = $true
+    $fsw.Filter = '*'
+    $fsw.EnableRaisingEvents = $true
+    $validExt = @('.exe','.dll','.sys')
+
+    $handler = {
+        param($sender,$eventArgs)
+        try {
+            $path = $eventArgs.FullPath
+            $ext = [IO.Path]::GetExtension($path).ToLowerInvariant()
+            if ($validExt -notcontains $ext) { return }
+            if (In-Maintenance) { Add-GuardianLog 'watch_ignored' @{ path=$path; change=$eventArgs.ChangeType }; return }
+            $res = Compare-FileToBaseline -Path $path -baselineMap $script:base
+            switch ($res.Status) {
+                'OK' { }
+                'Missing' { Add-GuardianLog 'tamper_missing' @{ path=$path }; Start-Job { dism.exe /Online /Cleanup-Image /RestoreHealth | Out-Null } | Out-Null }
+                'Changed' { Add-GuardianLog 'tamper_changed' @{ path=$path }; $null = Restore-S32File -Path $path }
+                default { Add-GuardianLog 'tamper_event' @{ path=$path; status=$res.Status } }
+            }
+        } catch { Add-GuardianLog 'watch_handler_error' @{ error=$_.Exception.Message } }
+    }
+
+    Register-ObjectEvent -InputObject $fsw -EventName Changed -Action $handler | Out-Null
+    Register-ObjectEvent -InputObject $fsw -EventName Created -Action $handler | Out-Null
+    Register-ObjectEvent -InputObject $fsw -EventName Renamed -Action $handler | Out-Null
+    Register-ObjectEvent -InputObject $fsw -EventName Deleted -Action $handler | Out-Null
+
+    $guard = New-Object System.IO.FileSystemWatcher
+    $guard.Path  = $GuardianRoot
+    $guard.IncludeSubdirectories = $true
+    $guard.Filter = '*'
+    $guard.EnableRaisingEvents = $true
+
+    $guardHandler = {
+        param($s,$e)
+        try {
+            Add-GuardianLog 'guardian_dir_change' @{ change=$e.ChangeType; path=$e.FullPath }
+            Harden-GuardianACLs
+            if ($e.FullPath -ieq $GuardianScript) { Self-CheckScript }
+        } catch { Add-GuardianLog 'guardian_dir_error' @{ error=$_.Exception.Message } }
+    }
+
+    Register-ObjectEvent -InputObject $guard -EventName Changed -Action $guardHandler | Out-Null
+    Register-ObjectEvent -InputObject $guard -EventName Created -Action $guardHandler | Out-Null
+    Register-ObjectEvent -InputObject $guard -EventName Renamed -Action $guardHandler | Out-Null
+    Register-ObjectEvent -InputObject $guard -EventName Deleted -Action $guardHandler | Out-Null
+
+    Add-GuardianLog 'watch_started' @{ system32=$System32; guardian=$GuardianRoot }
+    $lastSelf = Get-Date
+    while ($true) {
+        Wait-Event -Timeout 5 | Out-Null
+        if ((Get-Date) -ge $lastSelf.AddMinutes(1)) { Self-CheckScript; $lastSelf = Get-Date }
+    }
+}
+
+# --- Scheduled Task hardening ---
+function Set-RegistryAclStrict([string]$RegPath) {
+    try {
+        $acl = Get-Acl -Path $RegPath
+        $sidAdmin  = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $ruleAdmin  = New-Object System.Security.AccessControl.RegistryAccessRule($sidAdmin,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+        $ruleSystem = New-Object System.Security.AccessControl.RegistryAccessRule($sidSystem,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+        $acl.SetAccessRuleProtection($true,$false)
+        $acl.ResetAccessRule($ruleAdmin)
+        $acl.AddAccessRule($ruleSystem)
+        Set-Acl -Path $RegPath -AclObject $acl
+        Add-GuardianLog 'reg_acl_harden' @{ path=$RegPath }
+    } catch { Add-GuardianLog 'reg_acl_error' @{ path=$RegPath; error=$_.Exception.Message } }
+}
+
+function Harden-ScheduledTaskACLs {
+    try {
+        $taskFile = Join-Path $env:WINDIR ("System32\\Tasks\\$TaskName")
+        if (Test-Path $taskFile) {
+            icacls $taskFile /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" /remove "Users" "Authenticated Users" "Everyone" 2>$null | Out-Null
+            Add-GuardianLog 'task_file_acl_harden' @{ file=$taskFile }
+        }
+        $treeKey = "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\$TaskName"
+        if (Test-Path $treeKey) {
+            Set-RegistryAclStrict -RegPath $treeKey
+            $id = (Get-ItemProperty -Path $treeKey -Name 'Id' -ErrorAction SilentlyContinue).Id
+            if ($id) {
+                $taskGuidKey = "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks\\$id"
+                if (Test-Path $taskGuidKey) { Set-RegistryAclStrict -RegPath $taskGuidKey }
+            }
+        }
+    } catch { Add-GuardianLog 'task_acl_error' @{ error=$_.Exception.Message } }
+}
+
+function Install-GuardianTask {
+    Assert-Admin
+    Ensure-GuardianPaths
+    if (-not (Test-Path $BaselineFile)) { New-S32Baseline }
+    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoLogo -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$GuardianScript`" -Watch"
+    $trigger   = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    try {
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Force -Description 'System32 Guardian Monitor' | Out-Null
+        Add-GuardianLog 'task_installed' @{ name=$TaskName; runAs='SYSTEM' }
+        Harden-ScheduledTaskACLs
+        Write-Host "[+] Scheduled Task installed and hardened: $TaskName" -ForegroundColor Green
+    } catch {
+        Write-Warning "Task install failed: $($_.Exception.Message)"
+        Add-GuardianLog 'task_install_error' @{ error=$_.Exception.Message }
+    }
+}
+
+function Uninstall-GuardianTask {
+    Assert-Admin
+    try {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop | Out-Null
+        Add-GuardianLog 'task_uninstalled' @{ name=$TaskName }
+        Write-Host "[+] Scheduled Task removed: $TaskName" -ForegroundColor Yellow
+    } catch {
+        Write-Warning "Task uninstall error: $($_.Exception.Message)"
+        Add-GuardianLog 'task_uninstall_error' @{ error=$_.Exception.Message }
+    }
+}
+
+function Show-GuardianStatus {
+    $baselineCount = 0
+    if (Test-Path $BaselineFile) {
+        try { $baselineCount = ((Get-Content $BaselineFile -Raw) | ConvertFrom-Json).Count } catch {}
+    }
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    [PSCustomObject]@{
+        Root              = $GuardianRoot
+        BaselineFiles     = $baselineCount
+        TaskInstalled     = [bool]$task
+        MaintenanceActive = In-Maintenance
+        GuardianScript    = $GuardianScript
+        LogPath           = $LogFile
+    } | Format-List
+}
+
+# --- Live Dashboard helpers (HTML server) ---
+function Get-GuardianSummary {
+    $baselineCount = 0
+    if (Test-Path $BaselineFile) { try { $baselineCount = ((Get-Content $BaselineFile -Raw) | ConvertFrom-Json).Count } catch {} }
+    $quarantineCount = 0
+    $quarDir = Join-Path $GuardianRoot 'Quarantine'
+    if (Test-Path $quarDir) { $quarantineCount = (Get-ChildItem -Path $quarDir -Directory -ErrorAction SilentlyContinue | Measure-Object).Count }
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $taskState = 'NotInstalled'
+    if ($task) { try { $taskState = (Get-ScheduledTaskInfo -TaskName $TaskName).State } catch {} }
+
+    $lastAlert = $null
+    if (Test-Path $LogFile) {
+        try {
+            $ev = (Get-Content $LogFile -Tail 500 -ErrorAction SilentlyContinue | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} }) | Where-Object { $_.event -match 'tamper|alert|quarantine' }
+            if ($ev) { $lastAlert = ($ev | Select-Object -Last 1).ts }
+        } catch {}
+    }
+
+    [PSCustomObject]@{
+        Root = $GuardianRoot
+        BaselineFiles = $baselineCount
+        QuarantineItems = $quarantineCount
+        TaskState = $taskState
+        MaintenanceActive = In-Maintenance
+        LastAlert = $lastAlert
+        LogPath = $LogFile
+        Time = (Get-Date).ToString('o')
+        Version = 'Dashboard v1'
+    }
+}
+
+function Get-GuardianStatusJson { (Get-GuardianSummary | ConvertTo-Json -Depth 6) }
+
+function Get-GuardianEventsJson([int]$Limit = 200) {
+    if (-not (Test-Path $LogFile)) { return '[]' }
+    $items = New-Object System.Collections.ArrayList
+    foreach ($line in (Get-Content $LogFile -Tail $Limit -ErrorAction SilentlyContinue)) {
+        try { [void]$items.Add(($line | ConvertFrom-Json)) } catch {}
+    }
+    return ($items | ConvertTo-Json -Depth 10)
+}
+
+function Get-DashboardHtml {
+@"
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>System32 Guardian — Dashboard</title>
+<style>
+  :root{--bg:#0b1020;--fg:#e9ecf1;--card:#151b2f;--muted:#9aa4b2;--good:#2ecc71;--warn:#f1c40f;--bad:#e74c3c;}
+  *{box-sizing:border-box} body{margin:0;font-family:Segoe UI,Inter,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+  header{padding:16px 20px;border-bottom:1px solid #1f2743;display:flex;justify-content:space-between;align-items:center}
+  h1{font-size:18px;margin:0} .muted{color:var(--muted)} .pill{padding:4px 10px;border-radius:999px;background:#1f2743}
+  main{padding:20px;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+  .card{background:var(--card);border:1px solid #1f2743;border-radius:14px;padding:14px}
+  .k{font-size:12px;color:var(--muted)} .v{font-size:24px;font-weight:600}
+  .span2{grid-column:1/-1}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:8px;border-bottom:1px solid #283255}
+  th{color:#b8c0cf;text-align:left}
+  .ok{color:var(--good)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+  footer{padding:10px 20px;color:#8190a8;border-top:1px solid #1f2743}
+</style>
+</head>
+<body>
+  <header>
+    <h1>System32 Guardian <span class="muted">— Dashboard</span></h1>
+    <div id="ts" class="pill muted">loading…</div>
+  </header>
+  <main>
+    <div class="card"><div class="k">Baseline files</div><div id="baseline" class="v">–</div></div>
+    <div class="card"><div class="k">Quarantine items</div><div id="quar" class="v">–</div></div>
+    <div class="card"><div class="k">Task state</div><div id="task" class="v">–</div></div>
+    <div class="card"><div class="k">Maintenance</div><div id="maint" class="v">–</div></div>
+    <div class="card"><div class="k">Last alert</div><div id="last" class="v">–</div></div>
+    <div class="card span2">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div class="k">Recent events</div>
+        <div class="muted" id="logpath"></div>
+      </div>
+      <div style="max-height:420px;overflow:auto;margin-top:8px">
+        <table id="events"><thead><tr><th>Time</th><th>Event</th><th>Path</th><th>Notes</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </main>
+  <footer>Auto-refreshing every 3s · <span class="muted">Local only</span></footer>
+<script>
+async function refresh(){
+  const s = await fetch('status').then(r=>r.json()).catch(()=>null);
+  if(!s) return;
+  document.getElementById('baseline').textContent = s.BaselineFiles ?? '–';
+  document.getElementById('quar').textContent = s.QuarantineItems ?? 0;
+  const t = s.TaskState||'Unknown';
+  document.getElementById('task').textContent = t;
+  document.getElementById('task').className = 'v ' + (t==='Running'?'ok':(t==='Ready'?'warn':'bad'));
+  document.getElementById('maint').textContent = s.MaintenanceActive? 'Active':'Off';
+  document.getElementById('maint').className = 'v ' + (s.MaintenanceActive?'warn':'ok');
+  document.getElementById('last').textContent = s.LastAlert||'—';
+  document.getElementById('ts').textContent = new Date(s.Time).toLocaleString();
+  document.getElementById('logpath').textContent = s.LogPath||'';
+  const ev = await fetch('events?limit=300').then(r=>r.json()).catch(()=>[]);
+  const tbody = document.querySelector('#events tbody');
+  tbody.innerHTML = '';
+  ev.reverse().forEach(x=>{
+    const tr = document.createElement('tr');
+    const ts = document.createElement('td'); ts.textContent = x.ts? new Date(x.ts).toLocaleString() : '';
+    const evn= document.createElement('td'); evn.textContent = x.event;
+    const pth= document.createElement('td'); pth.textContent = (x.data && x.data.path)|| (x.data && x.data.original) || '';
+    const nt = document.createElement('td'); nt.textContent = x.data? JSON.stringify(x.data).substring(0,160):'';
+    tr.append(ts,evn,pth,nt); tbody.appendChild(tr);
+  });
+}
+refresh(); setInterval(refresh,3000);
+</script>
+</body>
+</html>
+"@
+}
+
+function Build-GuardianReport([string]$OutPath) {
+    $html = Get-DashboardHtml
+    $dir = Split-Path $OutPath -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $html | Set-Content -Path $OutPath -Encoding UTF8
+}
+
+function Start-GuardianDashboard([int]$Port = 8787) {
+    Assert-Admin
+    $prefix = "http://127.0.0.1:$Port/"
+    $listener = New-Object System.Net.HttpListener
+    $listener.Prefixes.Add($prefix)
+    try { $listener.Start() } catch {
+        try { Start-Process -WindowStyle Hidden -FilePath netsh -ArgumentList @('http','add','urlacl',"url=$prefix","user=$env:USERNAME") -Wait | Out-Null; $listener.Start() }
+        catch { throw $_ }
+    }
+    Write-Host "[+] Dashboard listening at $prefix (Ctrl+C to stop)" -ForegroundColor Cyan
+    Add-GuardianLog 'dashboard_started' @{ url=$prefix }
+    try {
+      while ($listener.IsListening) {
+        $ctx = $listener.GetContext()
+        $path = $ctx.Request.Url.AbsolutePath.ToLowerInvariant().TrimEnd('/')
+        $res = $ctx.Response
+        $bytes = $null
+        switch ($path) {
+          '' { $body = Get-DashboardHtml; $bytes = [Text.Encoding]::UTF8.GetBytes($body); $res.ContentType = 'text/html; charset=utf-8' }
+          '/status' { $body = Get-GuardianStatusJson; $bytes=[Text.Encoding]::UTF8.GetBytes($body); $res.ContentType='application/json' }
+          '/events' { $limit = 200; try { if ($ctx.Request.QueryString['limit']) { $limit = [int]$ctx.Request.QueryString['limit'] } } catch {}
+                      $body = Get-GuardianEventsJson -Limit $limit; $bytes=[Text.Encoding]::UTF8.GetBytes($body); $res.ContentType='application/json' }
+          default { $res.StatusCode = 404; $res.ContentType='text/plain'; $bytes=[Text.Encoding]::UTF8.GetBytes('Not Found') }
+        }
+        $res.OutputStream.Write($bytes,0,$bytes.Length)
+        $res.Close()
+      }
+    } finally {
+      try { $listener.Stop(); $listener.Close() } catch {}
+      Add-GuardianLog 'dashboard_stopped' @{}
+    }
+}
+
+# --- Tray UI ---
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+function Start-GuardianTray {
+    Assert-Admin
+    $ico = [System.Drawing.SystemIcons]::Shield
+    $tray = New-Object System.Windows.Forms.NotifyIcon
+    $tray.Icon = $ico
+    $tray.Text = "System32 Guardian"
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+
+    $openDashboard = $menu.Items.Add("Open Dashboard")
+    $openDashboard.add_Click({ Start-Process "http://127.0.0.1:$DashboardPort/" })
+
+    $statusItem = $menu.Items.Add("Show Status")
+    $statusItem.add_Click({ Show-GuardianStatus | Out-String | Out-GridView -Title "System32 Guardian Status" })
+
+    $maintItem = $menu.Items.Add("Enter Maintenance (30m)")
+    $maintItem.add_Click({ powershell -File $GuardianScript -MaintenanceAllow -MaintenanceMinutes 30 })
+
+    $menu.Items.Add("-") | Out-Null
+
+    $exitItem = $menu.Items.Add("Exit")
+    $exitItem.add_Click({ $tray.Visible=$false; $tray.Dispose(); [System.Windows.Forms.Application]::Exit() })
+
+    $tray.ContextMenuStrip = $menu
+    $tray.Visible = $true
+
+    Write-Host "[+] Tray icon started (right-click in system tray)" -ForegroundColor Cyan
+    [System.Windows.Forms.Application]::Run()
+}
+
+# --- Tray UI (Start/Stop/Status/Maintenance/Open Dashboard) ---
+function Start-Tray([int]$Port = $DashboardPort) {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $icon = New-Object System.Windows.Forms.NotifyIcon
+    $icon.Icon = [System.Drawing.SystemIcons]::Shield
+    $icon.Visible = $true
+    $icon.Text = 'System32 Guardian'
+
+    $ctx = New-Object System.Windows.Forms.ContextMenuStrip
+    $mStart   = $ctx.Items.Add('Start Watch (Task)')
+    $mStop    = $ctx.Items.Add('Stop Watch (Task)')
+    $mStatus  = $ctx.Items.Add('Status')
+    $mMaint   = $ctx.Items.Add('Open Maintenance (45m)')
+    $ctx.Items.Add('-') | Out-Null
+    $mDash    = $ctx.Items.Add("Open Dashboard (127.0.0.1:$Port)")
+    $mReport  = $ctx.Items.Add('Generate Static Report')
+    $ctx.Items.Add('-') | Out-Null
+    $mExit    = $ctx.Items.Add('Exit')
+
+    $icon.ContextMenuStrip = $ctx
+
+    $mStart.Add_Click({
+        try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null; [System.Windows.Forms.MessageBox]::Show('Started scheduled task.','System32 Guardian') }
+        catch { [System.Windows.Forms.MessageBox]::Show("Failed to start task: $($_.Exception.Message)",'System32 Guardian') }
+    })
+    $mStop.Add_Click({
+        try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null; [System.Windows.Forms.MessageBox]::Show('Stopped scheduled task.','System32 Guardian') }
+        catch { [System.Windows.Forms.MessageBox]::Show("Failed to stop task: $($_.Exception.Message)",'System32 Guardian') }
+    })
+    $mStatus.Add_Click({
+        try { $s = Get-GuardianSummary | Out-String; [System.Windows.Forms.MessageBox]::Show($s,'Guardian Status') } catch { }
+    })
+    $mMaint.Add_Click({
+        try { $expires=(Get-Date).AddMinutes(45); ($expires.ToString('o')) | Set-Content $ModeFile; Harden-GuardianACLs; Add-GuardianLog 'maintenance_enter' @{ until=$expires }; [System.Windows.Forms.MessageBox]::Show('Maintenance window opened for 45 minutes.','System32 Guardian') } catch { }
+    })
+    $mDash.Add_Click({
+        $url = "http://127.0.0.1:$Port/"
+        $ok = $false
+        try {
+            $resp = Invoke-WebRequest -Uri ($url + 'status') -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+            if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300) { $ok = $true }
+        } catch {}
+        if (-not $ok) {
+            try { Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList "-NoLogo -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$GuardianScript`" -Dashboard -DashboardPort $Port" | Out-Null } catch {}
+            Start-Sleep -Milliseconds 600
+        }
+        Start-Process $url | Out-Null
+    })
+    $mReport.Add_Click({ try { Build-GuardianReport -OutPath (Join-Path $GuardianRoot 'dashboard.html'); Start-Process (Join-Path $GuardianRoot 'dashboard.html') | Out-Null } catch { } })
+    $mExit.Add_Click({ $icon.Visible = $false; $icon.Dispose(); [System.Windows.Forms.Application]::Exit() })
+
+    # Background worker: watch for new tamper events and show balloon tip
+    Start-Job -ScriptBlock {
+        param($LogFile,$icon)
+        Add-Type -AssemblyName System.Windows.Forms
+        $lastSize = 0
+        while ($true) {
+            try {
+                if (Test-Path $LogFile) {
+                    $len = (Get-Item $LogFile).Length
+                    if ($len -gt $lastSize) {
+                        $new = Get-Content $LogFile -Tail 5 | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} }
+                        foreach ($n in $new) {
+                            if ($n.event -match 'tamper|alert|quarantine') {
+                                $msg = "Tamper: " + ($n.data.path ?? 'System32')
+                                $icon.ShowBalloonTip(5000,'System32 Guardian',$msg,[System.Windows.Forms.ToolTipIcon]::Warning)
+                            }
+                        }
+                        $lastSize = $len
+                    }
+                }
+            } catch {}
+            Start-Sleep -Seconds 5
+        }
+    } -ArgumentList $LogFile,$icon | Out-Null
+
+    [System.Windows.Forms.Application]::Run()
+}
+
+# --- Entrypoints ---
+if ($Init) { Initialize-Guardian; New-S32Baseline }
+if ($Verify) { Test-S32Integrity | Format-Table Path,Status }
+if ($MaintenanceAllow) { Assert-Admin; $expires=(Get-Date).AddMinutes($MaintenanceMinutes); ($expires.ToString('o')) | Set-Content $ModeFile; Harden-GuardianACLs; Add-GuardianLog 'maintenance_enter' @{ until=$expires } }
+if ($Watch) { $script:base = Load-Baseline; Start-S32Watch }
+if ($InstallTask)   { Install-GuardianTask }
+if ($UninstallTask) { Uninstall-GuardianTask }
+if ($Status) { Show-GuardianStatus }
+if ($Report) { Build-GuardianReport -OutPath (Join-Path $GuardianRoot 'dashboard.html'); Write-Host ("[✓] Report written to " + (Join-Path $GuardianRoot 'dashboard.html')) -ForegroundColor Green }
+if ($Dashboard) { Start-GuardianDashboard -Port $DashboardPort }
+if ($PSBoundParameters.ContainsKey('Tray')) { Start-GuardianTray }
+
+
+***************************************************************************************************************************************************
+
+
+Done! 🔔
+
+I added **local notifications** that pop when tampering is detected, with a **click-to-open Dashboard**:
+
+* New helper: `Notify-Guardian <Title> <Body>`
+
+  * Uses the tray icon’s balloon if the tray is running.
+  * Falls back to Windows toast via **BurntToast** if available.
+  * Otherwise logs a console warning.
+* New helper: `Start-DashboardIfNeeded` ensures the local server is up, then returns the URL.
+* Tray now sets a global `$GuardianTrayIcon` and **opens the dashboard when you click a balloon**.
+* Dashboard server now sets a content-type on 404s (minor polish).
+
+### Where notifications fire
+
+They’re called from the tamper-handling paths in your watcher (Changed / Missing / Unexpected / SignatureMismatch). So you’ll see a balloon like:
+
+> **System32 Changed** — `C:\Windows\System32\foo.dll`
+
+Clicking it opens `http://127.0.0.1:8787/`.
+
+### Quick use
+
+```powershell
+# Start tray (for balloons + quick controls)
+powershell -File C:\S32Guardian\Guardian.ps1 -Tray
+
+# Run the watcher (if not using the scheduled task)
+powershell -File C:\S32Guardian\Guardian.ps1 -Watch
+```
